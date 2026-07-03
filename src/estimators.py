@@ -123,16 +123,50 @@ def capped_simplex_weights(scores: np.ndarray, epsilon: float = 1.0 / 3.0) -> np
     return weights / weights.sum()
 
 
-def spectral_center_radius(vectors: np.ndarray, center: np.ndarray, epsilon: float = 1.0 / 3.0) -> float:
-    """Raio espectral local usado para auditar candidatos a centro."""
+def kl_project_capped_simplex(weights: np.ndarray, epsilon: float = 1.0 / 3.0) -> np.ndarray:
+    """Projeta por KL no conjunto W_{n,epsilon}.
+
+    Resolve argmin_p KL(p || weights) sujeito a sum(p)=1 e p_i <= 1/((1-eps)n).
+    A solucao tem a forma p_i = min(cap, scale * weights_i).
+    """
+
+    weights = np.maximum(np.asarray(weights, dtype=float), 1e-300)
+    n_points = len(weights)
+    cap = 1.0 / (n_points * (1.0 - epsilon))
+    weights = weights / weights.sum()
+
+    low = 0.0
+    high = 1.0
+    while np.minimum(cap, high * weights).sum() < 1.0:
+        high *= 2.0
+
+    for _ in range(100):
+        middle = (low + high) / 2.0
+        projected = np.minimum(cap, middle * weights)
+        if projected.sum() < 1.0:
+            low = middle
+        else:
+            high = middle
+
+    projected = np.minimum(cap, high * weights)
+    return projected / projected.sum()
+
+
+def weighted_center_and_scatter(vectors: np.ndarray, weights: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Calcula centro ponderado e segundo momento centrado ponderado."""
+
+    center = weights @ vectors
+    centered = vectors - center
+    scatter = np.einsum("i,ij,ik->jk", weights, centered, centered)
+    return center, (scatter + scatter.T) / 2.0
+
+
+def spectral_center_radius(vectors: np.ndarray, center: np.ndarray) -> float:
+    """Norma espectral do segundo momento uniforme em torno de um centro."""
 
     centered = vectors - center
     scatter = centered.T @ centered / len(centered)
-    eigenvalues, eigenvectors = np.linalg.eigh((scatter + scatter.T) / 2.0)
-    direction = eigenvectors[:, int(np.argmax(eigenvalues))]
-    weights = capped_simplex_weights((centered @ direction) ** 2, epsilon=epsilon)
-    weighted_scatter = np.einsum("i,ij,ik->jk", weights, centered, centered)
-    return float(np.linalg.eigvalsh((weighted_scatter + weighted_scatter.T) / 2.0).max())
+    return float(np.linalg.eigvalsh((scatter + scatter.T) / 2.0).max())
 
 
 def hlz_spectral_center(
@@ -141,41 +175,75 @@ def hlz_spectral_center(
     max_iter: int = 100,
     tolerance: float = 1e-9,
 ) -> np.ndarray:
-    """Agregador spectral-center para os vetores de bloco.
+    """Retorna apenas o centro espectral do Algorithm 1 de HLZ."""
 
-    Esta rotina implementa o mecanismo computacional usado pelo HLZ/spectral
-    reweighting: alterna entre encontrar a direcao de maior dispersao em torno
-    do centro e reponderar os blocos no simplex capado, descartando influencia
-    excessiva dos blocos mais distantes naquela direcao.
+    center, _, _ = hlz_spectral_reweighting(
+        vectors,
+        epsilon=epsilon,
+        max_iter=max_iter,
+        tolerance=tolerance,
+    )
+    return center
+
+
+def hlz_spectral_reweighting(
+    vectors: np.ndarray,
+    epsilon: float = 1.0 / 3.0,
+    max_iter: int = 100,
+    tolerance: float = 1e-9,
+) -> tuple[np.ndarray, np.ndarray, float]:
+    """Agregador HLZ/Filter por multiplicative weights.
+
+    Implementa o Algorithm 1 de Hopkins-Li-Zhang para spectral sample
+    reweighing: pesos uniformes, centro ponderado, maior autovetor do segundo
+    momento centrado, perdas quadraticas, update multiplicativo e projecao KL
+    em W_{n,epsilon}. Retorna a iteracao com menor norma espectral ponderada.
     """
 
     vectors = np.asarray(vectors, dtype=float)
     if len(vectors) == 1:
-        return vectors[0]
+        return vectors[0], np.array([1.0]), 0.0
 
-    center = coordinatewise_median(vectors)
     weights = np.full(len(vectors), 1.0 / len(vectors))
+    center, scatter = weighted_center_and_scatter(vectors, weights)
     best_center = center.copy()
-    best_radius = spectral_center_radius(vectors, best_center, epsilon=epsilon)
+    best_weights = weights.copy()
+    best_radius = float(np.linalg.eigvalsh(scatter).max())
+    eta = 0.5
+    rho = max(
+        float(np.max(np.sum((vectors - coordinatewise_median(vectors)) ** 2, axis=1))),
+        best_radius,
+        1e-12,
+    )
 
     for _ in range(max_iter):
-        previous = center.copy()
-        centered = vectors - center
-        scatter = np.einsum("i,ij,ik->jk", weights, centered, centered)
-        eigenvalues, eigenvectors = np.linalg.eigh((scatter + scatter.T) / 2.0)
-        direction = eigenvectors[:, int(np.argmax(eigenvalues))]
-        scores = (centered @ direction) ** 2
-        weights = capped_simplex_weights(scores, epsilon=epsilon)
-        center = weights @ vectors
-        radius = spectral_center_radius(vectors, center, epsilon=epsilon)
+        center, scatter = weighted_center_and_scatter(vectors, weights)
+        eigenvalues, eigenvectors = np.linalg.eigh(scatter)
+        radius = float(eigenvalues.max())
         if radius < best_radius:
             best_radius = radius
             best_center = center.copy()
+            best_weights = weights.copy()
 
-        if np.linalg.norm(center - previous) < tolerance:
+        direction = eigenvectors[:, int(np.argmax(eigenvalues))]
+        losses = ((vectors - center) @ direction) ** 2
+        rho = max(rho, float(losses.max()), 1e-12)
+        updated = weights * np.maximum(1.0 - eta * losses / rho, 1e-12)
+        next_weights = kl_project_capped_simplex(updated, epsilon=epsilon)
+
+        if np.linalg.norm(next_weights - weights, ord=1) < tolerance:
+            weights = next_weights
+            center, scatter = weighted_center_and_scatter(vectors, weights)
+            radius = float(np.linalg.eigvalsh(scatter).max())
+            if radius < best_radius:
+                best_center = center.copy()
+                best_weights = weights.copy()
+                best_radius = radius
             break
 
-    return best_center
+        weights = next_weights
+
+    return best_center, best_weights, best_radius
 
 
 def robust_covariance_action(
